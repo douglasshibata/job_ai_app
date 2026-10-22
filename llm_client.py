@@ -1,11 +1,14 @@
 import json
 import logging
+import os
 import re
 from abc import ABC, abstractmethod
 from typing import Type, TypeVar, Optional, Any, Dict, List, Tuple
 
-import requests
 from pydantic import BaseModel, ValidationError
+
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import SystemMessage, HumanMessage
 
 try:
     from job_ai_app.config import (
@@ -45,6 +48,89 @@ def extract_json_from_text(text: str) -> str:
     return text
 
 
+class LLMFactory:
+    """
+    Factory for instantiating LangChain BaseChatModel instances
+    supporting OpenAI, DeepInfra, Anthropic, Ollama, Groq, and Gemini.
+    """
+
+    @staticmethod
+    def create_chat_model(
+        provider: str,
+        model: Optional[str] = None,
+        api_key: Optional[str] = None,
+        base_url: Optional[str] = None,
+        temperature: float = 0.2
+    ) -> BaseChatModel:
+        provider = provider.lower().strip()
+
+        if provider == "openai":
+            from langchain_openai import ChatOpenAI
+            model_name = model or os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+            key = api_key or os.getenv("OPENAI_API_KEY")
+            return ChatOpenAI(
+                model=model_name,
+                api_key=key,
+                temperature=temperature
+            )
+
+        elif provider == "deepinfra":
+            from langchain_openai import ChatOpenAI
+            model_name = model or os.getenv("DEEPINFRA_MODEL", "meta-llama/Meta-Llama-3.1-70B-Instruct")
+            key = api_key or os.getenv("DEEPINFRA_API_KEY")
+            url = base_url or os.getenv("DEEPINFRA_BASE_URL", "https://api.deepinfra.com/v1/openai")
+            return ChatOpenAI(
+                model=model_name,
+                api_key=key,
+                base_url=url,
+                temperature=temperature
+            )
+
+        elif provider == "anthropic":
+            from langchain_anthropic import ChatAnthropic
+            model_name = model or os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022")
+            key = api_key or os.getenv("ANTHROPIC_API_KEY")
+            return ChatAnthropic(
+                model=model_name,
+                api_key=key,
+                temperature=temperature
+            )
+
+        elif provider == "gemini":
+            from langchain_google_genai import ChatGoogleGenerativeAI
+            model_name = model or os.getenv("GEMINI_MODEL", GEMINI_MODEL or "gemini-2.5-flash")
+            key = api_key or os.getenv("GEMINI_API_KEY", GEMINI_API_KEY)
+            return ChatGoogleGenerativeAI(
+                model=model_name,
+                google_api_key=key,
+                temperature=temperature
+            )
+
+        elif provider == "ollama":
+            from langchain_ollama import ChatOllama
+            model_name = model or os.getenv("OLLAMA_MODEL", OLLAMA_MODEL)
+            url = base_url or os.getenv("OLLAMA_HOST", OLLAMA_HOST)
+            return ChatOllama(
+                model=model_name,
+                base_url=url,
+                temperature=temperature
+            )
+
+        elif provider == "groq":
+            from langchain_openai import ChatOpenAI
+            model_name = model or GROQ_MODEL
+            key = api_key or GROQ_API_KEY
+            return ChatOpenAI(
+                model=model_name,
+                api_key=key,
+                base_url="https://api.groq.com/openai/v1",
+                temperature=temperature
+            )
+
+        else:
+            raise ValueError(f"Unsupported LLM provider: '{provider}'")
+
+
 class BaseLLMProvider(ABC):
     """Abstract Base Class for LLM Providers."""
 
@@ -80,75 +166,61 @@ class BaseLLMProvider(ABC):
             raise ValueError(f"Provider response invalid for schema {schema_class.__name__}: {e}")
 
 
-class GroqProvider(BaseLLMProvider):
-    """Groq API Provider."""
+class LangChainProvider(BaseLLMProvider):
+    """
+    Unified LangChain-backed Provider wrapping BaseChatModel created via LLMFactory.
+    """
 
-    def __init__(self, api_key: str = GROQ_API_KEY, model: str = GROQ_MODEL):
+    def __init__(
+        self,
+        provider: str,
+        model: Optional[str] = None,
+        api_key: Optional[str] = None,
+        base_url: Optional[str] = None
+    ):
+        self.provider_name = provider.lower().strip()
+        self.model_name = model
         self.api_key = api_key
-        self.model = model
-        self._client = None
+        self.base_url = base_url
+        self._chat_model: Optional[BaseChatModel] = None
 
     def is_available(self) -> bool:
-        return bool(self.api_key and len(self.api_key.strip()) > 5)
+        if self.provider_name in ["openai", "deepinfra", "anthropic", "groq", "gemini"]:
+            key = self.api_key or os.getenv(f"{self.provider_name.upper()}_API_KEY", "")
+            if self.provider_name == "groq" and not key:
+                key = GROQ_API_KEY
+            elif self.provider_name == "gemini" and not key:
+                key = GEMINI_API_KEY
+            return bool(key and len(key.strip()) > 5)
+        elif self.provider_name == "ollama":
+            import requests
+            url = self.base_url or os.getenv("OLLAMA_HOST", OLLAMA_HOST)
+            try:
+                r = requests.get(f"{url.rstrip('/')}/api/tags", timeout=2)
+                return r.status_code == 200
+            except Exception:
+                return False
+        return False
 
-    def _get_client(self):
-        if self._client is None and self.is_available():
-            from groq import Groq
-            self._client = Groq(api_key=self.api_key)
-        return self._client
+    def _get_model(self) -> BaseChatModel:
+        if self._chat_model is None:
+            self._chat_model = LLMFactory.create_chat_model(
+                provider=self.provider_name,
+                model=self.model_name,
+                api_key=self.api_key,
+                base_url=self.base_url
+            )
+        return self._chat_model
 
     def generate_text(self, prompt: str, system_prompt: Optional[str] = None) -> str:
-        client = self._get_client()
-        if not client:
-            raise RuntimeError("Groq API key not configured or invalid.")
-
+        model = self._get_model()
         messages = []
         if system_prompt:
-            messages.append({"role": "system", "content": system_prompt})
-        messages.append({"role": "user", "content": prompt})
+            messages.append(SystemMessage(content=system_prompt))
+        messages.append(HumanMessage(content=prompt))
 
-        response = client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            temperature=0.2,
-            response_format={"type": "json_object"} if "json" in (system_prompt or "").lower() else None
-        )
-        return response.choices[0].message.content or ""
-
-
-class GeminiProvider(BaseLLMProvider):
-    """Google Gemini API Provider."""
-
-    def __init__(self, api_key: str = GEMINI_API_KEY, model: str = GEMINI_MODEL):
-        self.api_key = api_key
-        self.model = model
-        self._client = None
-
-    def is_available(self) -> bool:
-        return bool(self.api_key and len(self.api_key.strip()) > 5)
-
-    def _get_client(self):
-        if self._client is None and self.is_available():
-            try:
-                from google import genai
-                self._client = genai.Client(api_key=self.api_key)
-            except Exception as e:
-                logger.error(f"Error initializing Google Gemini Client: {e}")
-                self._client = None
-        return self._client
-
-    def generate_text(self, prompt: str, system_prompt: Optional[str] = None) -> str:
-        client = self._get_client()
-        if not client:
-            raise RuntimeError("Google Gemini API key not configured or client initialization failed.")
-
-        full_prompt = f"{system_prompt}\n\nUser Request:\n{prompt}" if system_prompt else prompt
-
-        response = client.models.generate_content(
-            model=self.model,
-            contents=full_prompt,
-        )
-        return response.text or ""
+        response = model.invoke(messages)
+        return str(response.content or "")
 
     def generate_structured(
         self,
@@ -156,63 +228,41 @@ class GeminiProvider(BaseLLMProvider):
         schema_class: Type[T],
         system_prompt: Optional[str] = None
     ) -> T:
-        client = self._get_client()
-        if not client:
-            return super().generate_structured(prompt, schema_class, system_prompt)
-
-        full_prompt = f"{system_prompt}\n\nUser Request:\n{prompt}" if system_prompt else prompt
         try:
-            response = client.models.generate_content(
-                model=self.model,
-                contents=full_prompt,
-                config={
-                    "response_mime_type": "application/json",
-                    "response_schema": schema_class,
-                },
-            )
-            return schema_class.model_validate_json(response.text)
+            model = self._get_model()
+            structured_model = model.with_structured_output(schema_class)
+            messages = []
+            if system_prompt:
+                messages.append(SystemMessage(content=system_prompt))
+            messages.append(HumanMessage(content=prompt))
+            res = structured_model.invoke(messages)
+            if isinstance(res, schema_class):
+                return res
         except Exception as e:
-            logger.warning(f"Gemini structured response fallback to text parsing due to: {e}")
-            return super().generate_structured(prompt, schema_class, system_prompt)
+            logger.warning(f"LangChain with_structured_output fallback to text schema parsing due to: {e}")
+
+        return super().generate_structured(prompt, schema_class, system_prompt)
 
 
-class OllamaProvider(BaseLLMProvider):
-    """Local Ollama Provider."""
+class GroqProvider(LangChainProvider):
+    def __init__(self, api_key: str = GROQ_API_KEY, model: str = GROQ_MODEL):
+        super().__init__(provider="groq", model=model, api_key=api_key)
 
+
+class GeminiProvider(LangChainProvider):
+    def __init__(self, api_key: str = GEMINI_API_KEY, model: str = GEMINI_MODEL):
+        super().__init__(provider="gemini", model=model, api_key=api_key)
+
+
+class OllamaProvider(LangChainProvider):
     def __init__(self, host: str = OLLAMA_HOST, model: str = OLLAMA_MODEL):
-        self.host = host.rstrip("/")
-        self.model = model
-
-    def is_available(self) -> bool:
-        try:
-            r = requests.get(f"{self.host}/api/tags", timeout=2)
-            return r.status_code == 200
-        except Exception:
-            return False
-
-    def generate_text(self, prompt: str, system_prompt: Optional[str] = None) -> str:
-        url = f"{self.host}/api/chat"
-        messages = []
-        if system_prompt:
-            messages.append({"role": "system", "content": system_prompt})
-        messages.append({"role": "user", "content": prompt})
-
-        payload = {
-            "model": self.model,
-            "messages": messages,
-            "stream": False,
-            "options": {"temperature": 0.2}
-        }
-
-        resp = requests.post(url, json=payload, timeout=60)
-        resp.raise_for_request()
-        data = resp.json()
-        return data.get("message", {}).get("content", "")
+        super().__init__(provider="ollama", model=model, base_url=host)
 
 
 class UnifiedLLMClient:
     """
-    Unified LLM Client managing multiple providers with automated fallback logic.
+    Unified LLM Client managing multiple LangChain providers with automated fallback logic.
+    Supports OpenAI, DeepInfra, Anthropic, Ollama, Groq, and Gemini.
     """
 
     def __init__(self, primary_provider: str = PRIMARY_LLM_PROVIDER):
@@ -222,6 +272,14 @@ class UnifiedLLMClient:
             "ollama": OllamaProvider()
         }
         self.primary_name = primary_provider.lower()
+
+        # Dynamically register additional providers if specified as primary or available in environment
+        if self.primary_name not in self.providers and self.primary_name in ["deepinfra", "openai", "anthropic"]:
+            self.providers[self.primary_name] = LangChainProvider(self.primary_name)
+
+    def register_provider(self, name: str, provider: BaseLLMProvider):
+        """Registers or replaces an LLM provider dynamically."""
+        self.providers[name.lower()] = provider
 
     def get_provider_chain(self) -> List[Tuple[str, BaseLLMProvider]]:
         """Returns ordered list of (name, provider) starting with primary."""
